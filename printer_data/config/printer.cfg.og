@@ -728,111 +728,103 @@ gcode:
 #######################################################################
 [gcode_macro PRINT_START]
 gcode:
-  # -------------------------------
-  # FETCH PRINTER DATA / DEFAULTS
-  # -------------------------------
-  {% set target_bed = params.BED_TEMP|default(60)|int %}            # Target bed temp from slicer or default
-  {% set target_extruder = params.EXTRUDER_TEMP|default(195)|int %} # Target nozzle temp from slicer or default
-  {% set S_EXTRUDER_TEMP = 150|float %}                             # Preheat temp for cleaning/Z calibration
-  {% set initial_tool = params.TOOL|default("0")|int %}             # Default tool
-  {% set material = params.MATERIAL|default("PLA") %}               # Material string from slicer
-  {% set target_chamber = params.CHAMBER|default(40)|int %}         # Chamber target temperature
-  {% set x_wait = printer.toolhead.axis_maximum.x / 2 %}            # X center for waits/moves
-  {% set y_wait = printer.toolhead.axis_maximum.y / 2 %}            # Y center for waits/moves
-  {% set box_turtle = printer['gcode_macro _AFC_GLOBAL_VARS'].box_turtle_enable %}  # Box Turtle enable flag
+  # This part fetches data from your slicer. Such as bed temp, extruder temp, chamber temp and size of your printer.
+  {% set target_bed = params.BED_TEMP|default(60)|int %}
+  {% set target_extruder = params.EXTRUDER_TEMP|default(195)|int %}
+  {% set S_EXTRUDER_TEMP = 150|float %}   #Added 12/29/2025
+  {% set initial_tool = params.TOOL|default("0")|int %}     #Added 12/29/2025
+  {% set material = params.MATERIAL|default("PLA") %}
+  {% set target_chamber = params.CHAMBER|default("40")|int %}
+  {% set x_wait = printer.toolhead.axis_maximum.x|float / 2 %}
+  {% set y_wait = printer.toolhead.axis_maximum.y|float / 2 %}
+                
+  status_ready          #set led to ready stage
+  
+  # Homes the printer, sets absolute positioning and updates the Stealthburner leds.
+  STATUS_HOMING         # Sets SB-leds to homing-mode
+  G28                   # Full home (XYZ)
+  G90                   # Absolute position
 
-  status_ready                                                      # Set LEDs/status to ready
+  AFC_PARK              #AFC PARK 12/29/2025
 
-  # -------------------------------
-  # HOMING AND INITIAL PARK
-  # -------------------------------
-  STATUS_HOMING                                                     # LED homing mode
-  G28                                                                # Full XYZ home
-  G90                                                                # Absolute positioning
+  ##  Uncomment for bed mesh (1 of 2)
+  BED_MESH_CLEAR       # Clears old saved bed mesh (if any)
 
-  {% if box_turtle %}
-    AFC_PARK                                                         # Park tool in safe location (only if Box Turtle enabled)
+  # Checks if the bed temp is higher than 90c - if so then trigger a heatsoak.
+  {% if params.BED_TEMP|int > 90 %}
+    SET_DISPLAY_TEXT MSG="Bed: {target_bed}c"           # Displays info
+    STATUS_HEATING                                      # Sets SB-leds to heating-mode
+    M106 S255                                           # Turns on the PT-fan
+
+    ##  Uncomment if you have a Nevermore.
+    SET_FAN_SPEED FAN=BedFans SPEED=1.0                 # Turns on the nevermore
+
+    G1 X{x_wait} Y{y_wait} Z15 F9000                    # Goes to center of the bed
+    M190 S{target_bed}                                  # Sets the target temp for the bed and wait
+    SET_DISPLAY_TEXT MSG="Heatsoak: {target_chamber}c"  # Displays info
+    TEMPERATURE_WAIT SENSOR="temperature_sensor chamber_temp" MINIMUM={target_chamber}   # Waits for chamber to reach desired temp
+
+  # If the bed temp is not over 90c, then it skips the heatsoak and just heats up to set temp with a 5min soak
+  {% else %}
+    SET_DISPLAY_TEXT MSG="Bed: {target_bed}c"           # Displays info
+    STATUS_HEATING                                      # Sets SB-leds to heating-mode
+    G1 X{x_wait} Y{y_wait} Z15 F9000                    # Goes to center of the bed
+    M190 S{target_bed}                                  # Sets the target temp for the bed and wait
+    # not convinced that is needed for PLA and the likes
+    # SET_DISPLAY_TEXT MSG="Soak for 5min"                # Displays info
+    # G4 P300000                                          # Waits 5 min for the bedtemp to stabilize
   {% endif %}
 
-  BED_MESH_CLEAR                                                     # Clear previous bed mesh
+  # Go to purge bucket, heat to target temp, purge, cool to 150, wipe nozzle
+  clean_nozzle PURGE={target_extruder} CLEAN=150
 
-  # -------------------------------
-  # PARALLEL BED + NOZZLE PREHEAT + HEATSOAK
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="Bed: {target_bed}°C"                         # Show target bed temp on display
-  STATUS_HEATING                                                     # LED heating mode
-  M140 S{target_bed}                                                  # Start bed heat (no wait)
-  M104 S{S_EXTRUDER_TEMP}                                             # Start nozzle preheat to 150°C (no wait)
-  G1 X{x_wait} Y{y_wait} Z15 F9000                                   # Move to bed center
-  M190 S{target_bed}                                                 # Heat bed to target and wait
+  # Heating nozzle to 150 degrees. This helps with getting a correct Z-home
+  SET_DISPLAY_TEXT MSG="Hotend: 150c"          # Displays info
+  M109 S150                                    # Heats the nozzle to 150c
 
-  {% if target_bed > 90 %}
-    M106 S255                                                        # Turn on full fan to circulate heat
-    SET_FAN_SPEED FAN=BedFans SPEED=1.0                               # Nevermore bed fan if installed
-    SET_DISPLAY_TEXT MSG="Heatsoak: {target_chamber}°C"               # Show chamber heat target
-    TEMPERATURE_WAIT SENSOR="temperature_sensor chamber_temp" MINIMUM={target_chamber} # Wait for chamber to reach temp
-  {% endif %}
+  
+  # Quad gantry level AKA QGL
+  SET_DISPLAY_TEXT MSG="QGL"      # Displays info
+  STATUS_LEVELING                 # Sets SB-leds to leveling-mode
+  quad_gantry_level               # Levels the buildplate via QGL
+  G28 Z                           # Homes Z again after QGL
+  AFC_PARK                        # AFC Park 12/29/2025
 
-  # -------------------------------
-  # LOAD FILAMENT + DECONTAMINATOR CLEAN (PURGE + TUBE WIPE)
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="Loading T{initial_tool} + Nozzle clean"
-  M109 S{S_EXTRUDER_TEMP}                                             # Wait 150°C for safe load
-  T{initial_tool}                                                     # Box Turtle: Load lane 0-5 (triggers AFC load/poop/wipe if enabled)
-  clean_nozzle PURGE={target_extruder} CLEAN={S_EXTRUDER_TEMP}        # Purge at print temp → wipe at 150°C (ooze break-off)nozzle
+  SET_DISPLAY_TEXT MSG="Calibrating Z Offset"
+  STATUS_LEVELING
+  CALIBRATE_Z
+  G1 Z10 F6000
+  ACCEPT
 
-  # -------------------------------
-  # QUAD GANTRY LEVELING + Z CALIBRATION
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="QGL"                                         # Display leveling info
-  STATUS_LEVELING                                                     # LED leveling mode
-  quad_gantry_level                                                   # Run quad gantry leveling
-  G28 Z                                                               # Home Z after leveling
+  # Bed mesh (2 of 2)
+  SET_DISPLAY_TEXT MSG="Bed mesh"              # Displays info
+  STATUS_MESHING                               # Sets SB-leds to bed mesh-mode
+  bed_mesh_calibrate adaptive=1                # Starts bed mesh
 
-  {% if box_turtle %}
-    AFC_PARK                                                         # Park tool again if Box Turtle enabled
-  {% endif %}
+  # Go to purge bucket, heat to target temp, wipe nozzle
+  #clean_nozzle CLEAN={target_extruder}
 
-  SET_DISPLAY_TEXT MSG="Calibrating Z"                               # Display Z calibration info
-  CALIBRATE_Z                                                         # Run Z offset calibration
-  ACCEPT                                                              # Confirm Z calibration
-  G1 Z10 F6000                                                        # Raise Z for safety
+  # Heats up the nozzle up to target via data from slicer
+  SET_DISPLAY_TEXT MSG="Hotend: {target_extruder}c"             # Displays info
+  STATUS_HEATING                                                # Sets SB-leds to heating-mode
+  G1 X{x_wait} Y{y_wait} Z15 F9000                              # Goes to center of the bed
+  M107                                                          # Turns off partcooling fan
+  AFC_PARK                                                      #AFC PARK 12/29/2025
+  M109 S{target_extruder}                                       # Heats the nozzle to printing temp
 
-  # -------------------------------
-  # BED MESH
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="Bed mesh"                                    # Display info
-  STATUS_MESHING                                                      # LED mesh mode
-  bed_mesh_calibrate adaptive=1                                       # Run adaptive bed mesh
+  # Set material-specific settings (pressure advance, fan speed, etc.)
+  SET_PA_MATERIAL MATERIAL={material}
 
-  # -------------------------------
-  # FINAL NOZZLE HEAT
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="Hotend: {target_extruder}°C"                  # Display info
-  STATUS_HEATING                                                      # LED heating mode
-  G1 X{x_wait} Y{y_wait} Z15 F9000                                    # Move to center
-  M107                                                                # Turn off part cooling fan
-
-  {% if box_turtle %}
-    AFC_PARK                                                         # Park tool safely if Box Turtle enabled
-  {% endif %}
-
-  M109 S{target_extruder}                                             # Heat nozzle to final printing temp
-
-  # -------------------------------
-  # MATERIAL SETTINGS
-  # -------------------------------
-  SET_PA_MATERIAL MATERIAL={material}                                 # Set material-specific PA, fan, and settings
-
-  # -------------------------------
-  # PURGE LINE & START PRINT
-  # -------------------------------
-  SET_DISPLAY_TEXT MSG="Printer goes brr 🐢"                             # Display start info
-  STATUS_PRINTING                                                     # LED printing mode
-  G0 X{x_wait - 50} Y4 F10000                                         # Move to purge start
-  G91                                                                  # Set incremental positioning
-  VORON_PURGE                                                          # Purge line next to print
-  G90                                                                  # Back to absolute positioning
+  # Gets ready to print by doing a purge line and updating the SB-leds
+  SET_DISPLAY_TEXT MSG="Printer goes brr"          # Displays info
+  STATUS_PRINTING                                  # Sets SB-leds to printing-mode
+  G0 X{x_wait - 50} Y4 F10000                      # Moves to starting point
+  #G0 Z0.4                                         # Raises Z to 0.4
+  #G0 Z5
+  G91                                              # Incremental positioning 
+  #G1 X100 E20 F1000                               # Purge line
+  VORON_PURGE									   #purge line next to the print
+  G90                                              # Absolut position
 
     
 
