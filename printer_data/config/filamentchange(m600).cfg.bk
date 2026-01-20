@@ -1,0 +1,176 @@
+#gcodes coming from - https://github.com/bassamanator/Sovol-SV06-firmware/blob/sv06-plus/cfgs/misc-macros.cfg
+####################################
+#Set Idle Timeout for the Machine
+####################################
+[idle_timeout]
+timeout: 7600
+
+
+# NOTE If you're using a Raspberry Pi, you can uncomment the next 2 lines, optionally.
+# [temperature_sensor raspberry_pi]
+# sensor_type: temperature_host
+
+# NOTE If you're using a an Orange Pi, you can uncomment the next 3 lines, optionally.
+# [temperature_sensor Orange_Pi]
+# sensor_type: temperature_host
+# sensor_path: /sys/class/thermal/thermal_zone0/temp
+
+
+#################
+#display status 
+#################
+#provide status of the screen similar to M73
+[display_status]
+
+#######################
+# disable fil sensor
+########################
+[delayed_gcode DISABLEFILAMENTSENSOR]
+initial_duration: 1
+gcode:
+    SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE=0
+
+
+################################
+# Hidden macro for globals
+#################################
+[gcode_macro _globals]
+variable_filament_sensor_enabled: 1 # NOTE Enable(1) or disable(0) the filament sensor, if one is connected
+variable_beeping_enabled: 1 # NOTE Enable(1) or disable(0) beeping everywhere except during gantry calibration
+gcode:
+    # Don't delete this section
+
+[gcode_macro CONDITIONAL_BEEP]
+gcode:
+    # Parameters
+    {% set i = params.I|default(1)|int %}           ; Iterations (number of times to beep).
+    {% set dur = params.DUR|default(100)|int %}     ; Duration/wait of each beep in ms. Default 100ms.
+    {% set freq = params.FREQ|default(2000)|int %}  ; Frequency in Hz. Default 2kHz.
+
+    {% set BEEPING_ENABLED=printer["gcode_macro _globals"].beeping_enabled|default(-1)|int %}
+
+    {% if BEEPING_ENABLED == 1 %}
+        BEEP I={i} DUR={dur} FREQ={freq}
+    {% endif %}
+
+[gcode_macro ADJUST_FILAMENT_SENSOR_STATUS]
+gcode:
+    # Parameters
+    {% set NEWSTATUS = params.ENABLE|default(-1)|int %}
+
+    {% set FILAMENT_SENSOR_ENABLED=printer["gcode_macro _globals"].filament_sensor_enabled|default(-1)|int %}
+
+    {% if FILAMENT_SENSOR_ENABLED == 1 and NEWSTATUS != -1 %}
+        SET_FILAMENT_SENSOR SENSOR=filament_sensor ENABLE={NEWSTATUS}
+    {% endif %}
+
+[gcode_macro LOAD_FILAMENT]
+gcode:
+    M83                            ; set extruder to relative
+    G1 E30 F300                    ; load
+    G1 E15 F150                    ; prime nozzle with filament
+    M82                            ; set extruder to absolute
+    
+[gcode_macro UNLOAD_FILAMENT]
+gcode:
+    M83
+    G1 E10 F300                      ; soften tip
+    G1 E-40 F1800                   ; main retract
+    G4 P200                         ; allow filament to move
+    G1 E-40 F1800
+    G4 P200
+    G1 E-20 F1800                   ; final retract past gears
+    M82
+
+[gcode_macro M600]
+gcode:
+    CONDITIONAL_BEEP i=1 dur=300
+    CONDITIONAL_BEEP i=1 dur=100
+    CONDITIONAL_BEEP i=1 dur=100
+    CONDITIONAL_BEEP i=1 dur=300
+    CONDITIONAL_BEEP i=1 dur=300
+    CONDITIONAL_BEEP i=1 dur=100
+    CONDITIONAL_BEEP i=1 dur=300
+    CONDITIONAL_BEEP i=1 dur=100
+    CONDITIONAL_BEEP i=1 dur=300
+    PAUSE                ; Pause
+
+[gcode_macro PAUSE]
+rename_existing: BASE_PAUSE
+gcode:
+    # Parameters
+    {% set z = params.Z|default(10)|int %}                                                   ; z hop amount
+
+    {% if printer['pause_resume'].is_paused|int == 0 %}
+        SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE={z}                              ; set z hop variable for reference in resume macro
+        SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=etemp VALUE={printer['extruder'].target}    ; set hotend temp variable for reference in resume macro
+
+        ADJUST_FILAMENT_SENSOR_STATUS ENABLE=0
+
+        SAVE_GCODE_STATE NAME=PAUSE                                                          ; save current print position for resume
+        BASE_PAUSE                                                                           ; pause print
+        {% if (printer.gcode_move.position.z + z) < printer.toolhead.axis_maximum.z %}       ; check that zhop doesn't exceed z max
+            G91                                                                              ; relative positioning
+            G1 E-.7 F2700                                                                    ; retract filament by .7mm; to prevent ooze (jimmy)
+            G1 Z{z} F900                                                                     ; raise Z up by z hop amount
+        {% else %}
+            { action_respond_info("Pause zhop exceeds maximum Z height.") }                  ; if z max is exceeded, show message and set zhop value for resume to 0
+            SET_GCODE_VARIABLE MACRO=RESUME VARIABLE=zhop VALUE=0
+        {% endif %}
+        G90                                                                                  ; absolute positioning
+        G1 X{printer.toolhead.axis_maximum.x/2} Y{printer.toolhead.axis_minimum.y+5} F6000   ; park toolhead at front center
+        SAVE_GCODE_STATE NAME=PAUSEPARK                                                      ; save parked position in case toolhead is moved during the pause (otherwise the return zhop can error)
+          M83
+          G1 E-40 F1000
+          G4 P200
+          G1 E-40 F1000
+          G4 P200
+          G1 E-20 F1000
+          M82
+        M104 S0                                                                              ; turn off hotend
+        SET_IDLE_TIMEOUT TIMEOUT=43200                                                       ; set timeout to 12 hours
+    {% endif %}
+
+
+[gcode_macro RESUME]
+rename_existing: BASE_RESUME
+variable_zhop: 0
+variable_etemp: 0
+gcode:
+    # Parameters
+    {% set e = params.E|default(2.5)|int %}                                          ; hotend prime amount (in mm)
+
+    {% if printer['pause_resume'].is_paused|int == 1 %}
+        ADJUST_FILAMENT_SENSOR_STATUS ENABLE=1
+
+        SET_IDLE_TIMEOUT TIMEOUT={printer.configfile.settings.idle_timeout.timeout}  ; set timeout back to configured value
+        {% if etemp > 0 %}
+            M109 S{etemp|int}                                                        ; wait for hotend to heat back up
+        {% endif %}
+        RESTORE_GCODE_STATE NAME=PAUSEPARK MOVE=1 MOVE_SPEED=100                     ; go back to parked position in case toolhead was moved during pause (otherwise the return zhop can error)
+        G91                                                                          ; relative positioning
+        M83                                                                          ; relative extruder positioning
+        {% if printer[printer.toolhead.extruder].temperature >= printer.configfile.settings.extruder.min_extrude_temp %}
+            G1 Z{zhop * -1} E{e} F900                                                ; prime nozzle by E, lower Z back down
+        {% else %}
+            G1 Z{zhop * -1} F900                                                     ; lower Z back down without priming (just in case we are testing the macro with cold hotend)
+        {% endif %}
+        RESTORE_GCODE_STATE NAME=PAUSE MOVE=1 MOVE_SPEED=60                          ; restore position
+        BASE_RESUME                                                                  ; resume print
+    {% endif %}
+
+
+[gcode_macro BEEP]
+description: BEEP I=3 DUR=200 FREQ=2000: Beep 3 times, for 200ms each, at 2kHz frequency.
+gcode:
+    # Parameters
+    {% set i = params.I|default(1)|int %}           ; Iterations (number of times to beep).
+    {% set dur = params.DUR|default(100)|int %}     ; Duration/wait of each beep in ms. Default 100ms.
+    {% set freq = params.FREQ|default(2000)|int %}  ; Frequency in Hz. Default 2kHz.
+
+    {% for iteration in range(i|int) %}
+        SET_PIN PIN=BEEPER_pin VALUE=0.8 CYCLE_TIME={ 1.0/freq if freq > 0 else 1 }
+        G4 P{dur}
+        SET_PIN PIN=BEEPER_pin VALUE=0
+        G4 P{dur}
+    {% endfor %}
